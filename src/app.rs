@@ -1284,6 +1284,10 @@ pub struct Waku {
     task_state_sync_events: Receiver<Result<RemoteTaskStateSnapshot, String>>,
     runtimes: HashMap<Uuid, SessionRuntime>,
     runtime_attach_pending: HashSet<Uuid>,
+    /// Attachments requested while the same session is still hydrating. They
+    /// resume against the hydrated transcript and cursor instead of installing
+    /// a second whole-session snapshot that could overwrite newer state.
+    deferred_runtime_attachments: HashSet<Uuid>,
     runtime_attach_misses: HashMap<Uuid, u8>,
     /// Provider-neutral session work which may remain live after a turn ends.
     /// Runtime-only by design: providers reconcile their authoritative state
@@ -2882,6 +2886,7 @@ impl Waku {
                 task_state_sync_events,
                 runtimes: HashMap::new(),
                 runtime_attach_pending: HashSet::new(),
+                deferred_runtime_attachments: HashSet::new(),
                 runtime_attach_misses: HashMap::new(),
                 background_work: HashMap::new(),
                 last_background_work_tick: Instant::now(),

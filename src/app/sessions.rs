@@ -105,6 +105,11 @@ impl Waku {
             .iter()
             .find(|session| session.id == session_id)
             .is_some_and(|session| !session.detail_loaded);
+        // An in-flight attachment hydrates the same whole-session snapshot and
+        // will resolve the pending activation when it lands.
+        if self.runtime_attach_pending.contains(&session_id) {
+            return;
+        }
         if !needs_hydration || !self.session_hydrations.insert(session_id) {
             return;
         }
@@ -131,24 +136,16 @@ impl Waku {
                             .iter_mut()
                             .find(|existing| existing.id == session_id)
                         {
-                            *existing = session;
-                            true
+                            super::runtime::install_hydrated_session(existing, session)
                         } else {
                             false
                         };
-                        let pending = waku
-                            .pending_session_activation
-                            .filter(|pending| pending.session_id == session_id);
-                        if pending.is_some() {
-                            waku.pending_session_activation = None;
-                        }
-                        if replaced && let Some(pending) = pending {
-                            waku.finish_session_activation(session_id, pending.transition, cx);
-                        } else if waku.state.selected_session == Some(session_id) {
+                        if replaced && waku.state.selected_session == Some(session_id) {
                             waku.reset_visible_state();
                             waku.reset_transcript_rows(waku.transcript_row_count());
                             waku.refresh_composer_sources(cx);
                         }
+                        waku.resume_pending_session_activation(session_id, cx);
                     }
                     Err(error) => {
                         if waku
@@ -160,10 +157,44 @@ impl Waku {
                         waku.show_toast(tr!("errors.open_session", error = error));
                     }
                 }
+                if waku.deferred_runtime_attachments.remove(&session_id) {
+                    waku.start_runtime_attachment(session_id, cx);
+                }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Resolves a selection that waited for a whole-session snapshot, whether
+    /// hydration or an in-flight runtime attachment supplied that snapshot.
+    pub(super) fn resume_pending_session_activation(
+        &mut self,
+        session_id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self
+            .pending_session_activation
+            .filter(|pending| pending.session_id == session_id)
+        else {
+            return;
+        };
+        let Some(existing) = self
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+        else {
+            self.pending_session_activation = None;
+            return;
+        };
+        let detail_loaded = existing.detail_loaded;
+        if detail_loaded {
+            self.pending_session_activation = None;
+            self.finish_session_activation(session_id, pending.transition, cx);
+        } else {
+            self.ensure_session_loaded(session_id, cx);
+        }
     }
 
     fn activate_session(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
@@ -880,6 +911,9 @@ impl Waku {
     }
 
     pub(super) fn reset_session_runtime(&mut self, session_id: Uuid) {
+        self.runtime_attach_pending.remove(&session_id);
+        self.deferred_runtime_attachments.remove(&session_id);
+        self.runtime_attach_misses.remove(&session_id);
         if let Some(runtime) = self.runtimes.remove(&session_id) {
             runtime.driver.cancel();
             runtime.driver.close();

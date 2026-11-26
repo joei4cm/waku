@@ -1,4 +1,151 @@
 use super::*;
+use crate::model::RuntimeEventCursor;
+
+/// Cheap snapshot of the local projection fields a user action or runtime
+/// event can change while an attachment is opening on the background executor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SessionAttachFingerprint {
+    detail_loaded: bool,
+    cursor: Option<RuntimeEventCursor>,
+    status: SessionStatus,
+    updated_at: u64,
+    title: String,
+    queued_message_ids: Vec<Uuid>,
+    messages_len: usize,
+    last_message_len: usize,
+    transcript_blocks_len: usize,
+    turns_len: usize,
+    last_turn_status: Option<TurnStatus>,
+}
+
+impl SessionAttachFingerprint {
+    fn of(session: &AgentSession) -> Self {
+        Self {
+            detail_loaded: session.detail_loaded,
+            cursor: session.runtime_event_cursor,
+            status: session.status,
+            updated_at: session.updated_at,
+            title: session.title.clone(),
+            queued_message_ids: session
+                .queued_messages
+                .iter()
+                .map(|message| message.id)
+                .collect(),
+            messages_len: session.messages.len(),
+            last_message_len: session
+                .messages
+                .last()
+                .map(|message| message.content.len())
+                .unwrap_or_default(),
+            transcript_blocks_len: session.transcript_blocks.len(),
+            turns_len: session.turns.len(),
+            last_turn_status: session.turns.last().map(|turn| turn.status),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum RuntimeAttachSource {
+    /// The local session is still a list-only skeleton, so the background pass
+    /// must hydrate it before opening the daemon event subscription.
+    Hydrate {
+        fingerprint: Option<SessionAttachFingerprint>,
+    },
+    /// The local session is already hydrated. The daemon projection is fetched
+    /// too: a turn completed by another client must not be skipped merely
+    /// because this client kept an older transcript in memory.
+    Loaded {
+        cursor: Option<RuntimeEventCursor>,
+        fingerprint: SessionAttachFingerprint,
+        local_only: bool,
+    },
+}
+
+impl RuntimeAttachSource {
+    pub(super) fn for_session(session: Option<&AgentSession>, local_only: bool) -> Self {
+        match session {
+            Some(session) if session.detail_loaded => Self::Loaded {
+                cursor: session.runtime_event_cursor,
+                fingerprint: SessionAttachFingerprint::of(session),
+                local_only,
+            },
+            session => Self::Hydrate {
+                fingerprint: session.map(SessionAttachFingerprint::of),
+            },
+        }
+    }
+
+    /// Whether the local projection still matches the snapshot used to open
+    /// the prepared driver's replay subscription.
+    pub(super) fn is_current(&self, session: Option<&AgentSession>) -> bool {
+        let Some(session) = session else {
+            return false;
+        };
+        let current = SessionAttachFingerprint::of(session);
+        match self {
+            Self::Hydrate {
+                fingerprint: Some(expected),
+            } => &current == expected,
+            Self::Hydrate { fingerprint: None } => false,
+            Self::Loaded { fingerprint, .. } => &current == fingerprint,
+        }
+    }
+}
+
+/// A whole-session snapshot is installed only when the local row is still a
+/// skeleton. A newer hydrated projection always wins over a delayed result.
+pub(super) fn install_hydrated_session(
+    existing: &mut AgentSession,
+    hydrated: AgentSession,
+) -> bool {
+    if existing.detail_loaded {
+        return false;
+    }
+    *existing = hydrated;
+    true
+}
+
+/// Adopts an authoritative daemon projection without discarding follow-ups the
+/// user queued locally while the attachment was opening.
+pub(super) fn install_daemon_session(existing: &mut AgentSession, mut daemon: AgentSession) {
+    for queued in &existing.queued_messages {
+        if !daemon
+            .queued_messages
+            .iter()
+            .any(|message| message.id == queued.id)
+        {
+            daemon.queued_messages.push(queued.clone());
+        }
+    }
+    *existing = daemon;
+}
+
+/// Whether the daemon has applied events the local projection has not seen.
+/// A different runtime or daemon epoch makes the local cursor incomparable, so
+/// the daemon projection wins rather than risking an unbridgeable replay gap.
+pub(super) fn daemon_cursor_is_newer(
+    local: Option<RuntimeEventCursor>,
+    daemon: Option<RuntimeEventCursor>,
+) -> bool {
+    match (local, daemon) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(local), Some(daemon))
+            if local.runtime_id == daemon.runtime_id && local.epoch == daemon.epoch =>
+        {
+            daemon.sequence > local.sequence
+        }
+        (Some(_), Some(_)) => true,
+    }
+}
+
+struct PreparedRuntimeAttachment {
+    source: RuntimeAttachSource,
+    /// The daemon projection when a skeleton must be hydrated, or when the
+    /// daemon has already applied events absent from the loaded local session.
+    session: Option<AgentSession>,
+    driver: PreparedDriver,
+}
 
 fn workspace_ack(
     workspace: &waku_client::WorkspaceClient,
@@ -37,14 +184,12 @@ fn start_driver(mut request: DriverStartRequest, cwd: PathBuf) -> anyhow::Result
     Ok(PreparedDriver { handle, events })
 }
 
-fn attach_driver(
+fn prepare_attached_driver(
     daemon: waku_client::DaemonSupervisor,
     session_id: Uuid,
+    replay_cursor: Option<RuntimeEventCursor>,
     event_wake: smol::channel::Sender<()>,
-) -> anyhow::Result<Option<(AgentSession, PreparedDriver)>> {
-    let Some(session) = waku_client::persistence::hydrate_session(&daemon, session_id)? else {
-        return Ok(None);
-    };
+) -> anyhow::Result<Option<PreparedDriver>> {
     let client = daemon.client();
     let response = client.request(session_id, Uuid::nil(), waku_client::Command::AttachSession)?;
     let waku_client::ResponsePayload::SessionRuntime {
@@ -64,10 +209,59 @@ fn attach_driver(
         session_id,
         runtime_id,
         supports_steer,
-        session.runtime_event_cursor,
+        replay_cursor,
         event_tx,
     )?;
-    Ok(Some((session, PreparedDriver { handle, events })))
+    Ok(Some(PreparedDriver { handle, events }))
+}
+
+fn attach_driver(
+    daemon: waku_client::DaemonSupervisor,
+    session_id: Uuid,
+    event_wake: smol::channel::Sender<()>,
+    source: RuntimeAttachSource,
+) -> anyhow::Result<Option<PreparedRuntimeAttachment>> {
+    let (session, replay_cursor) = match &source {
+        RuntimeAttachSource::Hydrate { .. } => {
+            let Some(session) = waku_client::persistence::hydrate_session(&daemon, session_id)?
+            else {
+                return Ok(None);
+            };
+            let cursor = session.runtime_event_cursor;
+            (Some(session), cursor)
+        }
+        RuntimeAttachSource::Loaded {
+            cursor,
+            local_only: true,
+            ..
+        } => (None, *cursor),
+        RuntimeAttachSource::Loaded {
+            cursor,
+            local_only: false,
+            ..
+        } => {
+            let Some(daemon_session) =
+                waku_client::persistence::hydrate_session(&daemon, session_id)?
+            else {
+                return Ok(None);
+            };
+            let daemon_cursor = daemon_session.runtime_event_cursor;
+            if daemon_cursor_is_newer(*cursor, daemon_cursor) {
+                (Some(daemon_session), daemon_cursor)
+            } else {
+                (None, *cursor)
+            }
+        }
+    };
+    let Some(driver) = prepare_attached_driver(daemon, session_id, replay_cursor, event_wake)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PreparedRuntimeAttachment {
+        source,
+        session,
+        driver,
+    }))
 }
 
 fn load_remote_task_state(
@@ -1003,7 +1197,14 @@ impl Waku {
         );
         for session_id in &removed {
             self.runtime_attach_pending.remove(session_id);
+            self.deferred_runtime_attachments.remove(session_id);
             self.runtime_attach_misses.remove(session_id);
+            if self
+                .pending_session_activation
+                .is_some_and(|pending| pending.session_id == *session_id)
+            {
+                self.pending_session_activation = None;
+            }
             self.runtimes.remove(session_id);
             self.background_work.remove(session_id);
             self.remove_right_panel_session_state(*session_id);
@@ -1070,9 +1271,34 @@ impl Waku {
     }
 
     pub(super) fn start_runtime_attachment(&mut self, session_id: Uuid, cx: &mut Context<Self>) {
+        self.start_runtime_attachment_with_mode(session_id, false, cx);
+    }
+
+    fn start_runtime_attachment_with_mode(
+        &mut self,
+        session_id: Uuid,
+        local_only: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.runtimes.contains_key(&session_id)
-            || !self.runtime_attach_pending.insert(session_id)
+            || self.runtime_attach_pending.contains(&session_id)
         {
+            return;
+        }
+        // A selection hydration already owns this session's whole-detail pass.
+        // Wait for it, then open the subscription against the cursor it loaded.
+        if self.session_hydrations.contains(&session_id) {
+            self.deferred_runtime_attachments.insert(session_id);
+            return;
+        }
+        let source = RuntimeAttachSource::for_session(
+            self.state
+                .sessions
+                .iter()
+                .find(|candidate| candidate.id == session_id),
+            local_only,
+        );
+        if !self.runtime_attach_pending.insert(session_id) {
             return;
         }
         let daemon = self.daemon.clone();
@@ -1080,7 +1306,7 @@ impl Waku {
         cx.spawn(async move |waku, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { attach_driver(daemon, session_id, event_wake) })
+                .spawn(async move { attach_driver(daemon, session_id, event_wake, source) })
                 .await;
             let _ = waku.update(cx, move |waku, cx| {
                 waku.finish_runtime_attachment(session_id, result, cx);
@@ -1092,31 +1318,62 @@ impl Waku {
     fn finish_runtime_attachment(
         &mut self,
         session_id: Uuid,
-        result: anyhow::Result<Option<(AgentSession, PreparedDriver)>>,
+        result: anyhow::Result<Option<PreparedRuntimeAttachment>>,
         cx: &mut Context<Self>,
     ) {
         if !self.runtime_attach_pending.remove(&session_id) {
             return;
         }
         match result {
-            Ok(Some((session, prepared))) => {
+            Ok(Some(attachment)) => {
                 self.runtime_attach_misses.remove(&session_id);
+                let PreparedRuntimeAttachment {
+                    source,
+                    session,
+                    driver,
+                } = attachment;
+                let source_is_hydrate = matches!(&source, RuntimeAttachSource::Hydrate { .. });
                 let Some(index) = self
                     .state
                     .sessions
                     .iter()
                     .position(|candidate| candidate.id == session_id)
                 else {
+                    self.resume_pending_session_activation(session_id, cx);
+                    cx.notify();
                     return;
                 };
-                if !self.runtimes.contains_key(&session_id) {
-                    self.state.sessions[index] = session;
-                    self.install_prepared_driver(session_id, prepared);
-                    if self.state.selected_session == Some(session_id) {
-                        self.reset_visible_state();
-                        self.reset_transcript_rows(self.transcript_row_count());
-                    }
+                if self.runtimes.contains_key(&session_id) {
+                    // A newer attachment already owns the event subscription.
+                    // Dropping this handle only unsubscribes the duplicate.
+                    drop(driver);
+                    self.resume_pending_session_activation(session_id, cx);
                     cx.notify();
+                    return;
+                }
+                if !source.is_current(self.state.sessions.get(index)) {
+                    // The local projection moved while the daemon subscription
+                    // was opening. Its replay filter belongs to the old cursor,
+                    // so reattach against the current one instead of applying
+                    // events to a mismatched transcript. The retry keeps the
+                    // local cursor to avoid another whole-session refresh.
+                    drop(driver);
+                    self.start_runtime_attachment_with_mode(session_id, true, cx);
+                    self.resume_pending_session_activation(session_id, cx);
+                    cx.notify();
+                    return;
+                }
+                if let Some(session) = session {
+                    if source_is_hydrate {
+                        install_hydrated_session(&mut self.state.sessions[index], session);
+                    } else {
+                        install_daemon_session(&mut self.state.sessions[index], session);
+                    }
+                }
+                self.install_prepared_driver(session_id, driver);
+                if self.state.selected_session == Some(session_id) {
+                    self.reset_visible_state();
+                    self.reset_transcript_rows(self.transcript_row_count());
                 }
             }
             Ok(None) => {
@@ -1128,29 +1385,34 @@ impl Waku {
                     .is_some_and(|session| session.status.is_busy());
                 if !busy {
                     self.runtime_attach_misses.remove(&session_id);
-                    return;
-                }
-                let misses = self.runtime_attach_misses.entry(session_id).or_default();
-                *misses = misses.saturating_add(1);
-                if *misses < 4 {
-                    cx.spawn(async move |waku, cx| {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(250))
-                            .await;
-                        let _ = waku.update(cx, |waku, cx| {
-                            waku.start_runtime_attachment(session_id, cx);
-                        });
-                    })
-                    .detach();
                 } else {
-                    self.runtime_attach_misses.remove(&session_id);
-                    self.interrupt_orphaned_runtime(session_id, cx);
+                    let misses = self.runtime_attach_misses.entry(session_id).or_default();
+                    *misses = misses.saturating_add(1);
+                    let miss_count = *misses;
+                    if miss_count < 4 {
+                        cx.spawn(async move |waku, cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(250))
+                                .await;
+                            let _ = waku.update(cx, |waku, cx| {
+                                waku.start_runtime_attachment(session_id, cx);
+                            });
+                        })
+                        .detach();
+                    } else {
+                        self.runtime_attach_misses.remove(&session_id);
+                        self.interrupt_orphaned_runtime(session_id, cx);
+                    }
                 }
             }
             Err(error) => {
                 eprintln!("could not attach desktop to daemon session {session_id}: {error:#}");
             }
         }
+        // An attachment can serve the pending selection's hydration. If it did
+        // not produce a whole session, fall back to the ordinary hydration pass.
+        self.resume_pending_session_activation(session_id, cx);
+        cx.notify();
     }
 
     fn interrupt_orphaned_runtime(&mut self, session_id: Uuid, cx: &mut Context<Self>) {

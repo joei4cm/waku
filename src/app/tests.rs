@@ -2,7 +2,10 @@ use super::composer::{
     ComposerSubmitAction, composer_submit_action, dropped_file_mention, merged_submission,
     next_picker_highlight, visible_branch_entries,
 };
-use super::runtime::{merge_remote_session_catalog, session_has_active_provider_turn};
+use super::runtime::{
+    RuntimeAttachSource, daemon_cursor_is_newer, install_daemon_session, install_hydrated_session,
+    merge_remote_session_catalog, session_has_active_provider_turn,
+};
 use super::settings::visible_settings_pages;
 use super::{
     ESCAPE_STOP_CONFIRMATION_TIMEOUT, EscapeStopConfirmation, EscapeStopPress, EscapeStopTarget,
@@ -25,8 +28,9 @@ use super::{
 use crate::git_branch::BranchEntry;
 use crate::model::{
     ActivityItem, ActivityKind, AgentSession, Checkpoint, CheckpointFile, CheckpointStatus,
-    DriverEvent, Message, MessageRole, ProviderKind, ReasoningBlock, RuntimeEventCursor,
-    SessionStatus, TranscriptBlock, TurnStatus, UserInputOption, UserInputQuestion,
+    DriverEvent, Message, MessageRole, ProviderKind, QueuedMessage, ReasoningBlock,
+    RuntimeEventCursor, SessionStatus, TranscriptBlock, TurnStatus, UserInputOption,
+    UserInputQuestion,
 };
 
 #[test]
@@ -125,6 +129,94 @@ fn remote_task_catalog_adds_web_tasks_without_replacing_hydrated_detail() {
     assert_eq!(merged_local.messages.len(), 1);
     assert_eq!(merged_local.messages[0].content, "keep this transcript");
     assert!(catalog.iter().any(|session| session.id == web_task_id));
+}
+
+#[test]
+fn hydration_and_attachment_keep_the_newest_session_projection() {
+    let project_id = Uuid::new_v4();
+    let mut loaded = AgentSession::new(project_id, ProviderKind::Claude);
+    loaded
+        .messages
+        .push(Message::new(MessageRole::User, "keep this transcript"));
+    let skeleton = loaded.list_projection();
+    let cursor = RuntimeEventCursor {
+        runtime_id: Uuid::new_v4(),
+        epoch: Uuid::new_v4(),
+        sequence: 7,
+    };
+    let mut hydrated = loaded.clone();
+    hydrated.runtime_event_cursor = Some(cursor);
+
+    let attach_from_skeleton = RuntimeAttachSource::for_session(Some(&skeleton), false);
+    assert!(matches!(
+        &attach_from_skeleton,
+        RuntimeAttachSource::Hydrate { .. }
+    ));
+    assert!(attach_from_skeleton.is_current(Some(&skeleton)));
+    assert!(!attach_from_skeleton.is_current(Some(&hydrated)));
+    assert!(!attach_from_skeleton.is_current(None));
+    let mut skeleton_target = skeleton.clone();
+    assert!(install_hydrated_session(
+        &mut skeleton_target,
+        hydrated.clone()
+    ));
+    assert!(skeleton_target.detail_loaded);
+    assert_eq!(skeleton_target.runtime_event_cursor, Some(cursor));
+    assert!(!install_hydrated_session(&mut hydrated, skeleton.clone()));
+    assert_eq!(hydrated.messages[0].content, "keep this transcript");
+
+    let attach_from_hydrated = RuntimeAttachSource::for_session(Some(&hydrated), false);
+    assert!(matches!(
+        &attach_from_hydrated,
+        RuntimeAttachSource::Loaded {
+            cursor: Some(c),
+            local_only: false,
+            ..
+        } if *c == cursor
+    ));
+    let mut locally_streamed = hydrated.clone();
+    locally_streamed
+        .messages
+        .push(Message::new(MessageRole::User, "new event"));
+    assert!(!attach_from_hydrated.is_current(Some(&locally_streamed)));
+    let local_only = RuntimeAttachSource::for_session(Some(&locally_streamed), true);
+    assert!(local_only.is_current(Some(&locally_streamed)));
+
+    let newer_cursor = RuntimeEventCursor {
+        sequence: cursor.sequence + 1,
+        ..cursor
+    };
+    assert!(daemon_cursor_is_newer(Some(cursor), Some(newer_cursor)));
+    assert!(!daemon_cursor_is_newer(Some(newer_cursor), Some(cursor)));
+    assert!(!daemon_cursor_is_newer(Some(cursor), Some(cursor)));
+    assert!(daemon_cursor_is_newer(None, Some(cursor)));
+    let other_runtime = RuntimeEventCursor {
+        runtime_id: Uuid::new_v4(),
+        ..cursor
+    };
+    assert!(daemon_cursor_is_newer(Some(cursor), Some(other_runtime)));
+
+    let mut local = hydrated.clone();
+    let queued = QueuedMessage::new("local follow-up");
+    let queued_id = queued.id;
+    local.queued_messages.push(queued);
+    let mut daemon = hydrated;
+    daemon.runtime_event_cursor = Some(newer_cursor);
+    daemon
+        .messages
+        .push(Message::new(MessageRole::User, "another client's reply"));
+    install_daemon_session(&mut local, daemon);
+    assert_eq!(local.runtime_event_cursor, Some(newer_cursor));
+    assert_eq!(
+        local.messages.last().unwrap().content,
+        "another client's reply"
+    );
+    assert!(
+        local
+            .queued_messages
+            .iter()
+            .any(|message| message.id == queued_id)
+    );
 }
 
 #[test]
